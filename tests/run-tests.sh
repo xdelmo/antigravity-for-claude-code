@@ -142,6 +142,14 @@ case "${STUB_MODE:-text}" in
   # agy 1.1.27+ names the refused tools in the envelope. Measured on 1.2.0: the same rc 0 /
   # SUCCESS / empty response / notice as 1.1.25, plus denied_actions. Verbatim from a real run.
   json_denied_actions_120) echo 'jetski: no output produced — a tool required the "write_file" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. write_file(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.' >&2; printf '{"conversation_id":"b13cec1d-55f6-482f-903b-e6b18a76afed","status":"SUCCESS","response":"","duration_seconds":2.88004,"num_turns":1,"usage":{"input_tokens":22670,"output_tokens":73,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":22743},"denied_actions":[{"action":"write_file","display_name":"WriteToFile"}]}'; exit 0 ;;
+  # agy 1.4.2: the denial ends the turn, but resuming the conversation finishes it. Denied
+  # (verbatim shape from a 1.4.2 run) until the call carries --conversation, then a reply.
+  json_denied_then_ok) case " $* " in
+      *" --conversation c-den "*) printf '{"conversation_id":"c-den","status":"SUCCESS","response":"DENIED: touch zzz.txt\\nRECOVERED\\n","usage":{"input_tokens":10,"output_tokens":2,"thinking_tokens":0,"cache_read_tokens":8,"total_tokens":12}}' ;;
+      *) echo 'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.' >&2
+         printf '{"conversation_id":"c-den","status":"SUCCESS","response":"","usage":{"input_tokens":17450,"output_tokens":162,"thinking_tokens":57,"cache_read_tokens":0,"total_tokens":17612},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}' ;;
+    esac; exit 0 ;;
+  pwd)     pwd ;;
   # 1.1.28 made URL reads ask first; headless that is a denial too. Verbatim from 1.2.0.
   json_denied_readurl_120) echo 'jetski: no output produced — a tool required the "read_url" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. read_url(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.' >&2; printf '{"conversation_id":"2913e1f7-ea83-43be-8f0b-86834c541b00","status":"SUCCESS","response":"","duration_seconds":2.78866,"num_turns":1,"usage":{"input_tokens":22681,"output_tokens":41,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":22722},"denied_actions":[{"action":"read_url","display_name":"ReadUrlContent"}]}'; exit 0 ;;
   # agy 1.1.28: a --print-timeout that expires mid-turn returns the PARTIAL reply with rc 0,
@@ -562,6 +570,18 @@ check "agy 1.2.0 denied_actions still reports AGY_USAGE" 15 "$da_rc" "AGY_USAGE"
 da_err=$(STUB_JSON_CAPABLE=1 STUB_MODE=json_denied_readurl_120 "$DELEGATE" "fetch a page" 2>&1 >/dev/null); da_rc=$?
 check "agy 1.2.0 denied read_url (1.1.28 asks first) -> exit 15" 15 "$da_rc" "denied: read_url" "$da_err"
 check "the denial message names the read_url(<target>) rule" 15 "$da_rc" "read_url(<target>)" "$da_err"
+# A denial resumes the conversation, so agy finishes like a subagent whose tool call failed.
+rs_out=$(STUB_JSON_CAPABLE=1 STUB_MODE=json_denied_then_ok "$DELEGATE" "hunt bugs" 2>"$TMP/rs.err"); rs_rc=$?
+check "a denied command resumes the conversation and returns the reply" 0 "$rs_rc" "RECOVERED" "$rs_out"
+check "the resume says which tool was denied" 0 "$rs_rc" "denied 'command'" "$(cat "$TMP/rs.err")"
+check "the final note says the denied action was not performed" 0 "$rs_rc" "NOT performed" "$(cat "$TMP/rs.err")"
+# Still denied after two resumes: exit 15 as before, and agy was called exactly three times.
+cnt_bin="$TMP/cntbin"; mkdir -p "$cnt_bin"
+printf '#!/usr/bin/env bash\n[ "$1" = --help ] || echo x >> "%s/calls"\nexec "%s/bin/agy" "$@"\n' "$TMP" "$TMP" > "$cnt_bin/agy"; chmod +x "$cnt_bin/agy"
+rm -f "$TMP/calls"
+PATH="$cnt_bin:$PATH" STUB_JSON_CAPABLE=1 STUB_MODE=json_denied_actions_120 "$DELEGATE" "write a file" >/dev/null 2>&1; da_rc=$?
+check "a denial that survives two resumes -> exit 15" 15 "$da_rc"
+check "a lasting denial is resumed at most twice (3 calls)" 3 "$(wc -l < "$TMP/calls" | tr -d ' ')"
 # agy 1.1.28: an expired --print-timeout is rc 0 + the partial reply + one stderr line. The
 # wrapper must not pass that off as a finished reply: exit 12, with the partial text printed.
 pt_out=$(STUB_JSON_CAPABLE=1 STUB_MODE=json_partial_timeout_120 "$DELEGATE" --timeout 5s "write an essay" 2>"$TMP/pt.err"); pt_rc=$?
@@ -617,6 +637,25 @@ out=$(STUB_MODE=text CLAUDE_PLUGIN_OPTION_DIGEST_WARN_CHARS=5 "$DELEGATE" "hi" 2
 check "custom digest_warn_chars threshold respected" 0 "$rc" "raw dump" "$out"
 
 # WSL slow-mount note: fires only under WSL AND when --add-dir is on /mnt/*
+# agy runs commands where it starts (no cwd flag, measured on 1.4.2): the first --dir is it.
+mkdir -p "$TMP/wd/a" "$TMP/wd/b"
+out=$(cd "$TMP/wd/b" && STUB_MODE=pwd "$DELEGATE" --dir ../a --dir . "hi" 2>/dev/null); rc=$?
+check "agy starts in the first --dir" 0 "$rc" "$(cd "$TMP/wd/a" && pwd)" "$out"
+out=$(cd "$TMP/wd/b" && STUB_MODE=args "$DELEGATE" --dir ../a --dir . "hi" 2>/dev/null); rc=$?
+check "a relative second --dir is resolved before the cd" 0 "$rc" "--add-dir $(cd "$TMP/wd/b" && pwd) " "$out"
+out=$("$DELEGATE" --dir "$TMP/nope" "hi" 2>&1); rc=$?
+check "a --dir that does not exist is a usage error" 1 "$rc" "not a directory" "$out"
+# agy wants a Go duration; a bare number is seconds.
+out=$("$DELEGATE" --timeout 900 --print-command "hi" 2>&1); rc=$?
+check "--timeout 900 reaches agy as 900s" 0 "$rc" "--print-timeout 900s" "$out"
+# The command(...) allow-rules reach the prompt, so agy does not reach for a denied one.
+mkdir -p "$TMP/allowhome/.gemini/antigravity-cli"
+printf '%s' '{"permissions":{"allow":["command(grep)","command(git log)","write_file(/tmp/x)","command()"]}}' > "$TMP/allowhome/.gemini/antigravity-cli/settings.json"
+out=$(HOME="$TMP/allowhome" "$DELEGATE" --print-command "hi" 2>&1); rc=$?
+check "allowed terminal commands are listed in the prompt" 0 "$rc" "may run are: grep, git log." "$out"
+out=$(HOME="$TMP/allowhome" "$DELEGATE" --yolo --print-command "hi" 2>&1)
+if has "TERMINAL POLICY" "$out"; then echo "FAIL: --yolo still got the terminal policy"; FAIL=$((FAIL+1));
+else echo "ok: --yolo gets no terminal policy"; PASS=$((PASS+1)); fi
 out=$(WSL_DISTRO_NAME=Ubuntu "$DELEGATE" --dir /mnt/c/proj --print-command "hi" 2>&1); rc=$?
 check "WSL + /mnt --dir -> slow-mount note" 0 "$rc" "9p bridge" "$out"
 out=$(WSL_DISTRO_NAME=Ubuntu "$DELEGATE" --dir /home/u/proj --print-command "hi" 2>&1); rc=$?

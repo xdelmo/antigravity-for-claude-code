@@ -1,7 +1,7 @@
 ---
 name: antigravity
 description: Run the Antigravity CLI (Gemini) as a collaborating AI inside Claude Code, with intelligent model routing across the software development lifecycle. Claude is the conductor/orchestrator — requirements, architecture, the hard 20%, verification, and review — and routes deterministic, high-volume work (scaffolding, boilerplate, test generation, first-pass review, migrations, web/Vertex AI Search) to Antigravity (Gemini), the cheaper, faster model. Use when the user wants to "use Antigravity / agy", "vibe code / agentic engineering", "accelerate the SDLC", "delegate to Gemini", "scaffold / generate tests / migrate", "first-pass code review", "search web or internal/company data", "deep research / multi-source research report", "second-model cross-check", or "lower token cost on a big job". Claude always verifies Antigravity's output and re-checks itself if unsatisfied.
-version: 0.28.0
+version: 0.29.0
 ---
 
 # Antigravity for Claude Code — hybrid SDLC
@@ -105,8 +105,8 @@ the cross-model verification value (Claude executing Claude loses both).
 ```bash
 agy-delegate [options] "the task prompt"
 ```
-Options: `--tier flash|flash-lo|pro` · `--dir <path>` (workspace, repeatable) ·
-`--timeout 10m` · `--yolo` (auto-approve **ALL** tools — the blunt grant; needed for web search /
+Options: `--tier flash|flash-lo|pro` · `--dir <path>` (workspace, repeatable; agy runs its commands in the first one) ·
+`--timeout 10m` (a bare number is seconds) · `--yolo` (auto-approve **ALL** tools — the blunt grant; needed for web search /
 URL reads (agy 1.1.28+; or a `read_url(<target>)` rule) / Vertex AI Search / terminal, and for writes not covered by a `permissions.allow` rule. For a
 file write the narrower grant is usually a `write_file(<dir>)` entry in
 `~/.gemini/antigravity-cli/settings.json`, which needs no flag — see below. Run write tasks
@@ -229,7 +229,10 @@ commands** (`--yolo` grants write + terminal):
   with a stderr notice (1.1.3+), **hard error by 1.1.13**, soft again from **1.1.20**
   (measured on 1.1.25; since 1.1.27 also named in the envelope's `denied_actions`, 1.2.0) — but **your workspace stays
   untouched every time**; what varies is whether the run admits it (issue #10). The
-  wrapper maps the soft deny and the hard error alike to exit 15. **Two things grant a write, and `--yolo` is
+  wrapper maps the soft deny and the hard error alike to exit 15 — in JSON mode only after
+  resuming the conversation twice: agy drops its reply at a denial, but resumed it finishes
+  without the denied tool (measured on 1.4.2), and then the run exits 0 with a stderr note.
+  Without `--yolo` the prompt also lists the `command(...)` rules agy may run. **Two things grant a write, and `--yolo` is
   the blunt one.** A `write_file(<dir>)` entry under `permissions.allow` in
   `~/.gemini/antigravity-cli/settings.json` allows writes **recursively beneath `<dir>`**
   with no flag at all — confirmed on agy 1.1.9 by a controlled A/B (#37): covered target

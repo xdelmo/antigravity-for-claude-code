@@ -3,6 +3,28 @@
 All notable changes to **Antigravity for Claude Code**. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are in `.claude-plugin/plugin.json`.
 
+## 0.29.0
+
+- **A denied tool no longer throws the delegation away.** Headless agy ends its turn at the
+  first tool it may not use and drops the reply, even when told to carry on — measured on agy
+  1.4.2: rc 0, an empty response, `denied_actions: [{"action":"command"}]`, and no word of
+  which command. The conversation survives, though: resumed with `--conversation <id>` and
+  told the tool is off limits, agy kept its context (cache read), named the exact command
+  and finished. The wrapper now does that itself, at most twice, and exits 0 with a stderr
+  note that the denied action was not performed; exit 15 is what remains when agy still has
+  no reply. Plain-text mode has no conversation id and is unchanged.
+- **The prompt lists the terminal commands agy may run.** Without `--yolo`, the
+  `command(...)` rules in `~/.gemini/antigravity-cli/settings.json` are appended as a
+  terminal policy, so agy reads files with its own tools instead of reaching for a command
+  that ends its turn. Measured on 1.4.2: told to run `touch` or `ls; touch`, it declined and
+  answered.
+- **`--dir` is where agy runs.** agy has no working-directory flag and `--add-dir` only adds
+  a readable root, so `git log` with `--dir <repo>` read the caller's repo. The first `--dir`
+  is now also agy's start directory; every `--dir` is made absolute first, and one that does
+  not exist is a usage error.
+- **`--timeout 900` means 900 seconds.** agy wants a Go duration and printed its help on a
+  bare number; the wrapper now passes `900s`.
+
 ## 0.28.0
 
 - **`AGY_USAGE` now names the model that ran, the tier it was picked from, and agy's own

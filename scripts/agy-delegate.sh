@@ -21,8 +21,9 @@
 #
 # Options:
 #   -t, --tier <flash|flash-lo|pro>  Model tier (default: flash)
-#   -d, --dir  <path>                Add a workspace dir (repeatable)
-#       --timeout <dur>              Print-mode timeout, e.g. 10m (default: 5m)
+#   -d, --dir  <path>                Add a workspace dir (repeatable). The first one is also
+#                                    where agy runs its commands (it uses its start directory)
+#       --timeout <dur>              Print-mode timeout, e.g. 10m or 900 (seconds) (default: 5m)
 #       --yolo                       Auto-approve all tool permissions (DANGEROUS). Reaches agy as
 #                                    --dangerously-skip-permissions; agy 1.1.25 rejects a literal --yolo
 #       --sandbox                    Run agent with terminal sandbox restrictions
@@ -50,6 +51,8 @@
 #             |    denied_actions, measured on 1.2.0) and 1.1.13's hard error (rc 1, "user
 #             |    denied permission", 1.1.13-1.1.19). Add a permissions.allow rule, or --yolo.
 #             |    URL reads need a grant too since 1.1.28 (read_url(<target>), or the flag).
+#             |    In JSON mode a denial first RESUMES the conversation (up to twice) so agy
+#             |    can finish without the denied tool; 15 only when it still has no reply.
 #
 # On a classifiable failure, a machine-readable line is printed to stderr so
 # orchestrators (e.g. agy-job.sh) can react without scraping prose:
@@ -257,6 +260,8 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$PROMPT" ] || die "no prompt given (pass a string, or '-' to read stdin)"
+# agy wants a Go duration; a bare number made it print its help and fail. Read it as seconds.
+case "$TIMEOUT" in *[!0-9]*|'') ;; *) TIMEOUT="${TIMEOUT}s" ;; esac
 # --print-command is a dry run (introspection), so it doesn't require agy on PATH.
 if [ "$PRINT_CMD" -ne 1 ] && ! command -v agy >/dev/null 2>&1; then
   echo "agy-delegate: 'agy' not found on PATH — install the Antigravity CLI first" >&2
@@ -335,6 +340,35 @@ if [ "$DIGEST" -eq 1 ]; then
 OUTPUT CONTRACT (digest): reply with ONLY a compact digest — short bullets (findings / decisions / errors, with file:line references where useful). NO full file contents, NO raw logs, NO long code blocks. End with exactly one line: DIGEST: <one-sentence summary>."
 fi
 
+# Headless agy ends its turn at the first terminal command no rule allows, so tell it up
+# front which ones it may run: the command(...) rules in its settings.json.
+if [ "$YOLO" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
+  ALLOWED_CMDS="$(python3 - "$HOME/.gemini/antigravity-cli/settings.json" <<'PY' 2>/dev/null || true
+import json, sys
+allow = ((json.load(open(sys.argv[1])) or {}).get("permissions") or {}).get("allow") or []
+print(", ".join(r[8:-1].strip() for r in allow
+                if isinstance(r, str) and r.startswith("command(") and r.endswith(")") and r[8:-1].strip()))
+PY
+)"
+  if [ -n "$ALLOWED_CMDS" ]; then
+    PROMPT="$PROMPT
+
+TERMINAL POLICY: the only terminal commands you may run are: $ALLOWED_CMDS. Any other command, including running scripts, is denied and ends your turn — read and search files with your file tools instead."
+  fi
+fi
+
+# agy has no working-directory flag: it runs commands where it was started, and --add-dir
+# only adds a readable root (measured on 1.4.2 — `git log` with --dir read the caller's
+# repo). So it is started in the first --dir, after the dry run below. Absolute paths
+# first, or a relative second --dir would resolve against that new directory. The dry run
+# keeps them as given, so it works for a directory that is not on this machine.
+if [ "${#ADD_DIRS[@]}" -gt 0 ] && [ "$PRINT_CMD" -ne 1 ]; then
+  for i in "${!ADD_DIRS[@]}"; do
+    d="${ADD_DIRS[i]}"
+    ADD_DIRS[i]="$(cd "$d" 2>/dev/null && pwd)" || die "--dir '$d' is not a directory"
+  done
+fi
+
 # --- assemble agy args ---
 # NOTE: in agy, -p/--print/--prompt TAKES THE PROMPT AS ITS VALUE, so it must come
 # last with the prompt attached. Other flags go before it.
@@ -343,8 +377,10 @@ for d in "${ADD_DIRS[@]:-}"; do [ -n "$d" ] && ARGS+=(--add-dir "$d"); done
 [ "$YOLO" -eq 1 ]      && ARGS+=(--dangerously-skip-permissions)
 [ -n "$MODE" ]         && ARGS+=(--mode "$MODE")     # agy >= 1.1.0
 [ "$SANDBOX" -eq 1 ]   && ARGS+=(--sandbox)
-[ "$CONTINUE" -eq 1 ]  && ARGS+=(--continue)        # keep working context on the cheap (Gemini) side
-[ -n "$CONV_ID" ]      && ARGS+=(--conversation "$CONV_ID")
+# Kept apart from ARGS: resuming after a denial (below) swaps them for --conversation <id>.
+CONV_ARGS=()
+[ "$CONTINUE" -eq 1 ]  && CONV_ARGS=(--continue)    # keep working context on the cheap (Gemini) side
+[ -n "$CONV_ID" ]      && CONV_ARGS=(--conversation "$CONV_ID")
 
 # --- structured output (agy >= 1.1.8) -----------------------------------------
 # agy gained `--output-format json`, which is strictly better for a wrapper than
@@ -406,9 +442,12 @@ esac
 
 # --- dry run: print the resolved (shell-quoted) agy invocation and exit ---
 if [ "$PRINT_CMD" -eq 1 ]; then
-  { printf 'agy'; printf ' %q' "${ARGS[@]}" -p "$PROMPT"; printf '\n'; }
+  { printf 'agy'; printf ' %q' "${ARGS[@]}" ${CONV_ARGS[@]+"${CONV_ARGS[@]}"} -p "$PROMPT"; printf '\n'; }
   exit 0
 fi
+
+# Start agy in the first --dir (made absolute above).
+[ "${#ADD_DIRS[@]}" -gt 0 ] && cd "${ADD_DIRS[0]}"
 
 # --- run (always detach stdin so non-TTY stdout is not dropped) ---
 # Per-invocation temp file for stderr (mktemp avoids the race + symlink risk of a
@@ -435,13 +474,20 @@ if on_windows_native && [ -z "$TO_CMD" ]; then
   echo "agy-delegate:   call never returns, run from WSL/macOS/Linux, or install coreutils \`timeout\`." >&2
 fi
 
+# A denied tool ends agy's turn and drops its reply, but the conversation survives
+# (measured on 1.4.2: resumed with --conversation, it kept its context, named the denied
+# command and finished). So a denial resumes it, like a subagent whose tool call came
+# back as an error. RESUMES bounds that; DENIED_SEEN reports it once the run is over.
+RESUMES=0; DENIED_SEEN=""
+RESUME_PROMPT="Your last tool call was denied by policy and will not be allowed: do not retry it, rephrase it, or reach the same result another way. Finish the original task with what you already have. Start your reply with one line naming the exact command or action that was denied."
+while :; do
 set +e
 if [ -n "$TO_CMD" ]; then
   # --kill-after sends SIGKILL if agy ignores the initial SIGTERM (defensive).
-  "$TO_CMD" --kill-after=10 "$TO_SECS" agy "${ARGS[@]}" -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
+  "$TO_CMD" --kill-after=10 "$TO_SECS" agy "${ARGS[@]}" ${CONV_ARGS[@]+"${CONV_ARGS[@]}"} -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
   RC=$?
 else
-  agy "${ARGS[@]}" -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
+  agy "${ARGS[@]}" ${CONV_ARGS[@]+"${CONV_ARGS[@]}"} -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
   RC=$?
 fi
 OUT="$(cat "$OUTF" 2>/dev/null)"
@@ -451,7 +497,7 @@ set -e
 # Replaces OUT with the model's text so the stdout contract is unchanged, exposes
 # the structured error for classification, and reports token usage on stderr.
 # Any parse failure falls back to treating OUT as plain text (never fatal).
-JSON_STATUS=""; JSON_ERROR=""; JSON_DENIED=""
+JSON_STATUS=""; JSON_ERROR=""; JSON_DENIED=""; JSON_CONV=""
 # Glob, not ${OUT//[...]/}: stripping the whole string to test emptiness is minutes-to-
 # hours at tens of KB on macOS /bin/bash 3.2 (n^~2.6); the glob stops at the first hit.
 if [ "$JSON_MODE" -eq 1 ] && [[ "$OUT" = *[!$' \t\n\r']* ]]; then
@@ -515,6 +561,7 @@ PY
   if [ -n "$meta" ]; then
     # `status` is a bare enum with no quotes inside it, so sed is safe there.
     JSON_STATUS="$(printf '%s' "$meta" | sed -n 's/.*"status": *"\([^"]*\)".*/\1/p')"
+    JSON_CONV="$(printf '%s' "$meta" | sed -n 's/.*"conversation_id": *"\([^"]*\)".*/\1/p')"
     JSON_ERROR="$(cat "$JERR" 2>/dev/null)"
     JSON_DENIED="$(cat "$JDEN" 2>/dev/null)"
     OUT="$(cat "$RESP" 2>/dev/null)"
@@ -525,6 +572,16 @@ PY
   fi
   rm -f "$RESP" "$JERR" "$JDEN"
 fi
+
+if [ "$RC" -eq 0 ] && [ -n "$JSON_DENIED" ] && [ -n "$JSON_CONV" ] && [ "$RESUMES" -lt 2 ] \
+   && [[ "$OUT" != *[!$' \t\n\r']* ]]; then
+  RESUMES=$((RESUMES + 1)); DENIED_SEEN="${DENIED_SEEN:+$DENIED_SEEN }$JSON_DENIED"
+  echo "agy-delegate: agy was denied '$JSON_DENIED' and ended its turn — resuming conversation $JSON_CONV so it finishes without it ($RESUMES/2)" >&2
+  CONV_ARGS=(--conversation "$JSON_CONV"); PROMPT="$RESUME_PROMPT"
+  continue
+fi
+break
+done
 
 # `timeout` exits 124 (SIGTERM) or 137 (SIGKILL after --kill-after) when it had to
 # kill agy. Treat that as our structured TIMEOUT (exit 12), not a generic failure.
@@ -643,6 +700,9 @@ WARN_CHARS="${CLAUDE_PLUGIN_OPTION_DIGEST_WARN_CHARS:-8000}"
 case "$WARN_CHARS" in (*[!0-9]*|'') WARN_CHARS=8000 ;; esac
 if [ "$WARN_CHARS" -gt 0 ] && [ "${#OUT}" -gt "$WARN_CHARS" ]; then
   echo "agy-delegate: note: output is ${#OUT} chars (> ${WARN_CHARS}) — that looks like a raw dump, not a digest. Don't ingest this into the conductor's context: re-run with --digest, or have agy summarize it first. (plugin option digest_warn_chars tunes this; 0 disables.)" >&2
+fi
+if [ -n "$DENIED_SEEN" ]; then
+  echo "agy-delegate: note: agy was denied '$DENIED_SEEN' and finished after resuming — the denied action was NOT performed; the reply's first line names it." >&2
 fi
 
 printf '%s\n' "$OUT"
